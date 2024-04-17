@@ -4,23 +4,52 @@ import time
 import serial
 import serial.tools.list_ports
 
-port = "COM4"
-# ports = list(serial.tools.list_ports.comports())
-# for p in ports:
-#     print(p)
-#     if "Arduino" in p.description:
-#
+def find_arduino_port():
+    arduino_ports = [
+        p.device for p in serial.tools.list_ports.comports()
+        if 'Arduino' in p.description
+    ]
+    if arduino_ports:
+        return arduino_ports[0]
+    else:
+        return None
 
-def protocol(toUpd):
-    return "$" + str(toUpd) + ","
+arduino_port = find_arduino_port()
+if arduino_port:
+    print(f"Arduino найден на порту: {arduino_port}")
+else:
+    print("Arduino не найден")
 
-uart = serial.Serial(port, 115200)
+uart = serial.Serial(arduino_port, 115200)
 
-time.sleep(1)
-uart.setDTR(False)
-time.sleep(1)
+class ProtocolMessage:
+    def __init__(self, code: int = 0, data: [] = []):
+        self.code: code = code
+        self.data: [] = data
+        self.length: int = len(self.data) # TODO Длина - количество байтов. Пока для теста - количество переменных (3x 16 bit). После, в класс передадим данные уже в байтах
 
-# Подключаем камеру
+    def serialize(self):
+        # Serialize header
+        result = '$'.encode('utf-8') + 'M'.encode('utf-8') + '<'.encode('utf-8')
+        # Serialize Data
+        result += self.length.to_bytes(1, 'little') + int(self.code).to_bytes(1, 'little')
+        # Нативно ардуино примет сообщение младшим битом вперед.
+        # Помним об этом когда пишем парсинг сообщения на ардуино 1111111100000000 (BIG) -> 0000000011111111 (little)
+        for item in self.data:
+            # Здесь полагаем что каждое передаваемое данное будет 16 bit -> 2 байта, хватит для большинства задач
+            # float - по 4 байта
+            result += int(item).to_bytes(2, 'little')
+
+        # Serialize Checksum
+        # Обязательно обнуляем чексумму.
+        checksum = 0
+        for i in result[3:]:
+            checksum = checksum ^ i #XORим чексумму, при этом важно, что здесь должны быть переработаны именно байты. 16, 32 битные данные нужно при проверке чексуммы дробить.
+        result += checksum.to_bytes(1, 'little')
+
+        # Return result
+        return result
+
 cap = cv2.VideoCapture(0)
 cap.set(3, 640)  # Ширина
 cap.set(4, 480)  # Длина
@@ -30,13 +59,9 @@ mpHands = mp.solutions.hands
 hands = mpHands.Hands(max_num_hands=1)
 npDraw = mp.solutions.drawing_utils
 
-pTime = 0
-cTime = 0
-temp_x = 0
-temp_y = 0
 
 # Экспоненциальное сглаживание координат точек
-alpha = 0.5
+alpha = 0.5 #Надо разобрать для Никиты
 prev_landmarks = None
 
 p = [0 for i in range(21)]   # создаем массив из 21 ячейки для хранения высоты каждой точки
@@ -52,18 +77,27 @@ while True:
     success, img = cap.read()
     img = cv2.flip(img, 1)  # Зеркальное отражение
 
-    # Применяем медианный фильтр к изображению
-    filtered_img = cv2.medianBlur(img, 5)  # Используем размер ядра 5x5
+    filtered_img = cv2.medianBlur(img, 5)
 
     imgRGB = cv2.cvtColor(filtered_img, cv2.COLOR_BGR2RGB)  # Преобразуем в RGB
     results = hands.process(imgRGB)
     desired_landmark_indices = [0, 4, 8, 12, 16, 20]  # Пример: только верхние точки пальцев
     if results.multi_hand_landmarks:
+        hand_landmarks = results.multi_hand_landmarks[0]
+        #image_height, image_width, = imgRGB.shape
+        landmarks = hand_landmarks.landmark
+        # x_min, x_max = min(landmark.x for landmark in landmarks), max(landmark.x for landmark in landmarks) # Попытка обрезать изображение по верхним и  нижним точкам пальцев
+        # y_min, y_max = min(landmark.y for landmark in landmarks), max(landmark.y for landmark in landmarks)
+        #
+        # x_min_pixel, x_max_pixel = int(x_min * image_width), int(x_max * image_width)
+        # y_min_pixel, y_max_pixel = int(y_min * image_height), int(y_max * image_height)
+        # cropped_image = imgRGB[y_min_pixel:y_max_pixel, x_min_pixel:x_max_pixel]
+
         for handLms in results.multi_hand_landmarks:
             current_landmarks = []
             for id, lm in enumerate(handLms.landmark):
                 h, w, c = img.shape
-                cx, cy = int(lm.x * w), int(lm.y * h)
+                cx, cy = int(lm.x * w), int(lm.y * h) #Проверить нужность данного кода
 
                 p[id] = int(handLms.landmark[id].y * h)
                 p1[id] = int(handLms.landmark[id].x * w)
@@ -81,8 +115,8 @@ while True:
                     # Если индекс не в списке желаемых, не рисуем точку
                     continue
                 # Обрабатываем или рисуем эту точку
-                cv2.circle(filtered_img, (cx, cy), 10, (255, 0, 255), cv2.FILLED)
-                cv2.putText(filtered_img, f'{id}: ({cx}, {cy})', (cx, cy), cv2.FONT_HERSHEY_PLAIN, 1, (255, 0, 255), 2)
+                cv2.circle(img, (cx, cy), 10, (255, 0, 255), cv2.FILLED)
+                cv2.putText(img, f'{id}: ({cx}, {cy})', (cx, cy), cv2.FONT_HERSHEY_PLAIN, 1, (255, 0, 255), 2)
                 if len(handLms.landmark) > 0:  # Убеждаемся, что у нас есть хо`тя бы одна точка
                     for point_id in desired_landmark_indices:
                         if(point_id == 0):
@@ -93,7 +127,7 @@ while True:
                         x1, y1 = int(handLms.landmark[0].x * w), int(handLms.landmark[0].y * h)  # Нулевая точка
                         x2, y2 = int(handLms.landmark[point_id].x * w), int(
                         handLms.landmark[point_id].y * h)  # Текущая точка
-                        cv2.line(filtered_img, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                        cv2.line(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
                 #p[21] = int(temp_y * h)
                 #p1[21] = int(temp_x * w)
             prev_landmarks = current_landmarks
@@ -106,31 +140,19 @@ while True:
     distanceGoodForHand = distance(p1[5],p[9])
 
         # заполняем массив 1 (палец поднят) или 0 (палец, сжат)
-    # finger[1] = 1 if distance(p[0], p[8]) > distanceGood else 0
-    # finger[2] = 1 if distance(p[0], p[12]) > distanceGood else 0
-    # if distance(p[0], p[16]) > distanceGood and distance(p[0], p[20]) > distanceGood:
-    #     finger[3] = 1
-    # elif distance(p[0], p[16]) < distanceGood and distance(p[0], p[20]) < distanceGood:
-    #     finger[3] = 0
-    # finger[0] = 1 if distance(p[0], p[4]) > distanceGoodForBB else 0
-    # finger[4] = 1 if p1[3] > p1[5] else 0
+    finger[0] = 1 if distance(p[0], p[8]) > distanceGood else 0
+    finger[1] = 1 if distance(p[0], p[12]) > distanceGood else 0
+    if distance(p[0], p[16]) > distanceGood and distance(p[0], p[20]) > distanceGood:
+        finger[2] = 1
+    elif distance(p[0], p[16]) < distanceGood and distance(p[0], p[20]) < distanceGood:
+        finger[2] = 0
+    finger[3] = 1 if distance(p[0], p[4]) > distanceGoodForBB else 0
+    finger[4] = 1 if p1[3] > p1[5] else 0
 
-    msg = ''
-    msg = protocol(distance(p[0], p[8])) + protocol(distance(p[0], p[12])) + ";"
-
-    # отправляем сообщение в Arduino
-
-    if msg != '':
-        msg = bytes(msg, 'utf-8')
-        uart.write(msg)
-        print(msg)
-
-    cTime = time.time()
-    fps = 1 / (cTime - pTime)
-    pTime = cTime
-    cv2.putText(filtered_img, str(int(fps)), (10, 30), cv2.FONT_HERSHEY_PLAIN, 2, (255, 0, 0), 2)  # ФреймРейт
-
-    cv2.imshow('python', filtered_img)
+    uart.write((ProtocolMessage(112, finger).serialize()))
+    print(ProtocolMessage(112, finger).serialize())
+    time.sleep(0.05)
+    cv2.imshow('python', img)
     if cv2.waitKey(20) == 27:  # Выход по ESC
         break
 
